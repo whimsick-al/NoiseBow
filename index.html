@@ -1,0 +1,366 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="description" content="NoiseBow: your rainbow of noise colours. Layered white, pink, brown and more, with tilt, cut filters, density, saved stacks and audio export.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌈</text></svg>">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NoiseBow</title>
+<style>
+  :root { color-scheme: light dark; box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  body { font: 16px system-ui; display: grid; gap: 1rem; justify-items: center; align-content: start; padding: 1rem; }
+  select, button, input { font: inherit; }
+  label { display: grid; grid-template-columns: 1fr auto; gap: .25rem .5rem; width: 100%; }
+  input[type=range] { grid-column: 1 / -1; width: 100%; margin: 0; }
+  .top, .row, #stack, .layer { width: min(24rem, 100%); }
+  .top, .row { display: flex; gap: .5rem; align-items: center; }
+  .top select, .row input { flex: 1; min-width: 0; }
+  #stack { display: grid; gap: 1rem; }
+  .layer > * { box-sizing: border-box; min-width: 0; }
+  .layer > * + * { margin-top: .5rem; }
+  .layer > .row { margin-top: 1rem; }
+  .layer summary button { min-width: 2.5rem; margin-right: .25rem; }
+  .layer { box-sizing: border-box; padding: .75rem; border: 1px solid color-mix(in srgb, currentColor 35%, transparent); border-radius: .5rem; }
+  .layer summary { cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+  #add { width: min(24rem, 100%); font-size: 2rem; }
+  #io, #pick { width: min(24rem, 100%); box-sizing: border-box; }
+  #io { font: .85rem ui-monospace, monospace; }
+  .note { font-size: .85rem; opacity: .75; }
+  header { text-align: center; }
+  h1 { margin: 0; font-size: 1.8rem; }
+  header p { margin: 0; opacity: .75; }
+  p { max-width: 24rem; text-align: center; margin: 0; }
+</style>
+<header><h1>NoiseBow</h1><p>your rainbow of noise colours</p></header>
+<div class="top"><select id="stacks"></select><button id="b">Play</button></div>
+<label>Volume<input id="vol" type="range" min="0" max="1" step="0.01" value="0.2"></label>
+<div id="stack"></div>
+<button id="add">+</button>
+<div class="row"><input id="snm" placeholder="Stack name"><button id="saveStack">Save stack</button><button id="delStack" hidden>Delete</button></div>
+<div class="row"><select id="fmt"><option value="wav">WAV</option><option value="mp3-128">MP3 128k</option><option value="mp3-192">MP3 192k</option><option value="mp3-320">MP3 320k</option></select><button id="audioBtn">Save audio</button></div>
+<div class="row"><button id="share">Share</button><button id="saveJson">Save JSON</button><button id="imp">Import</button></div>
+<textarea id="io" rows="4" placeholder="Shared stack text appears here. Paste one here to import it."></textarea>
+<input id="pick" type="file" accept=".json,application/json">
+<p id="info"></p>
+<p class="note">Audio saves as 5 whole loops (~55–60 s) that repeat seamlessly. WAV is best for looping; MP3 adds a small gap at the loop point. Keep the volume low: deep presets can stress small speakers. MP3 encoding by lamejs (LGPL, lame.sourceforge.net), loaded on demand.</p>
+<script>
+// ---- dsp ----
+const N = 2 ** 19;     // power of two; spectral synthesis makes the loop periodic, so it is seamless
+const TARGET = 0.1;    // A-weighted RMS every sound is scaled to, unless the peak cap hits first
+
+// in-place radix-2 FFT
+const fft = (re, im, inv) => {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (inv ? 2 : -2) * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), h = len / 2;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < h; k++) {
+        const a = i + k, c = a + h;
+        const tr = re[c] * cr - im[c] * ci, ti = re[c] * ci + im[c] * cr;
+        re[c] = re[a] - tr; im[c] = im[a] - ti;
+        re[a] += tr;        im[a] += ti;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+  if (inv) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+};
+
+// A-weighting magnitude (IEC 61672), 0 dB at 1 kHz
+const A = f => {
+  const f2 = f * f;
+  return 1.2589 * 12194 ** 2 * f2 * f2 /
+    ((f2 + 20.6 ** 2) * Math.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2)) * (f2 + 12194 ** 2));
+};
+
+// grey: smooth approximation of an inverse equal-loudness curve, in dB
+const greyDb = f => 12 / (1 + (f / 200) ** 2)
+  - 8 * Math.exp(-((Math.log(f / 3500) / 0.7) ** 2))
+  + 8 / (1 + (9000 / f) ** 2);
+
+// white source: each sample is +-1 with probability pr, else 0 (pr = 1 is dense binary white noise)
+const source = pr => Float64Array.from({ length: N }, () => Math.random() < pr ? (Math.random() < 0.5 ? 1 : -1) : 0);
+
+// shape the spectrum: power-law tilt, brickwall cuts, optional grey. Returns [signal, A-weighted RMS]
+const shape = (x, sr, p) => {
+  const n = x.length, re = x, im = new Float64Array(n), a = p.tilt / 6.0206; // dB/oct -> amplitude exponent
+  fft(re, im);
+  let power = 0;
+  for (let k = 0; k <= n / 2; k++) {
+    const f = k * sr / n;
+    let h = k && f >= p.lo && f <= p.hi ? (f / 1000) ** a : 0;
+    if (h && p.grey) h *= 10 ** (p.grey * greyDb(f) / 20);
+    re[k] *= h; im[k] *= h;
+    const mirror = k && k < n / 2;
+    if (mirror) { re[n - k] *= h; im[n - k] *= h; }
+    power += (mirror ? 2 : 1) * (re[k] ** 2 + im[k] ** 2) * A(f) ** 2;
+  }
+  fft(re, im, true);
+  return [re, Math.sqrt(power) / n];
+};
+
+const peak = x => x.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+// ---- end dsp ----
+const P0 = {
+  white:      [0,   1.3, 4.3,  1,    0, 'Flat spectrum, 0 dB/oct. Standard.'],
+  pink:       [-3,  1.3, 4.3,  1,    0, '1/f, \u22123 dB/oct. Standard.'],
+  brown:      [-6,  1.3, 4.3,  1,    0, '1/f\u00b2, \u22126 dB/oct. Standard.'],
+  blue:       [3,   1.3, 4.3,  1,    0, '+3 dB/oct. Standard.'],
+  violet:     [6,   1.3, 4.3,  1,    0, '+6 dB/oct. Standard.'],
+  grey:       [0,   1.3, 4.3,  1,    1, 'White shaped by an approximate inverse equal-loudness curve. Informal.'],
+  green:      [0,   2.4, 3,    1,    0, 'White band-limited to 250\u20131000 Hz, around 500 Hz. Informal; definitions vary.'],
+  green2:     [0,   2.6, 2.8,  1,    0, 'Narrower: 400\u2013630 Hz. My variant of the idea.'],
+  black1:     [0,   1.3, 4.3,  0.15, 0, 'Silence with sporadic single-sample spikes (~5/s). One informal definition.'],
+  black2:     [-12, 1.3, 4.3,  1,    0, 'Steeper than brown, \u221212 dB/oct. Other informal definition. Mostly sub-bass.'],
+  black3:     [-18, 1.3, 4.3,  1,    0, '\u221218 dB/oct. Rumble with almost no mids.'],
+  black4:     [-24, 1.3, 4.3,  1,    0, '\u221224 dB/oct. Nearly pure sub-bass.'],
+  'brown-lp': [-6,  1.3, 2.48, 1,    0, 'Brown cut off above 300 Hz. Dull, soft rumble.'],
+  'deep brown': [-6, 1.3, 2.08, 1,   0, 'Brown cut off above 120 Hz. Heavy thump, no hiss.'],
+  infra:      [-12, 1.3, 1.7,  1,    0, '\u221212 dB/oct, 20\u201350 Hz only. Felt more than heard; needs a subwoofer or good headphones.'],
+  velvet:     [0,   1.3, 4.3,  0.71, 0, 'Sparse random impulses, ~2000/s. Real technique (reverb, decorrelation).'],
+};
+
+const hz = x => Math.round(10 ** x);
+const line = v => `${v[0]} ${hz(v[1])} ${hz(v[2])} ${v[3]} ${v[4]} ${v[5]}`; // tilt, low Hz, high Hz, density, grey, level
+const load = k => { try { return JSON.parse(localStorage.getItem(k)) ?? {}; } catch { return {}; } };
+const store = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+// layer presets: name -> [tilt, lo, hi, den, grey, level, description]
+const P = Object.fromEntries(Object.entries(P0).map(([k, v]) => [k, [...v.slice(0, 5), 10, v[5]]]));
+const mine = Object.fromEntries(Object.entries(load('noise-presets')).map(([k, v]) => [k, v.length === 6 ? [...v.slice(0, 5), 10, v[5]] : v]));
+const stacksMine = load('noise-stacks'); // name -> [layer values, ...]
+const all = () => ({ ...P, ...mine });
+
+const SL = [['tilt', 'Tilt', -24, 6, .5, 0], ['lo', 'Low cut', 1.3, 4.2, .01, 1.3], ['hi', 'High cut', 1.4, 4.3, .01, 4.3],
+            ['den', 'Density', 0, 1, .01, 1], ['grey', 'Grey', 0, 1, .05, 0], ['level', 'Level', 0, 11, 1, 10]];
+const FMT = { tilt: v => `${v} dB/oct`, lo: v => `${hz(v)} Hz`, hi: v => `${hz(v)} Hz`,
+              den: v => v === '1' ? 'dense' : `${Math.round(44100 ** v)}/s`, grey: v => `${Math.round(v * 100)}%`, level: v => v };
+const layers = () => [...stack.children];
+const sl = (d, k) => d.querySelector(`[data-k=${k}]`);
+const vals = d => SL.map(([k]) => +sl(d, k).value);
+
+// the sliders are the state; names, readouts and menus are derived from them
+const refreshStack = () => {
+  const cur = JSON.stringify(layers().map(vals));
+  const n = Object.keys(stacksMine).find(k => JSON.stringify(stacksMine[k]) === cur) ?? 'custom';
+  stacks.value = n;
+  delStack.hidden = n === 'custom';
+};
+const refresh = d => {
+  const v = vals(d), a = all();
+  const name = Object.keys(a).findLast(k => v.slice(0, 5).every((x, i) => x === a[k][i])) ?? 'custom';
+  d.querySelector('.ps').value = name;
+  d.querySelector('.dl').hidden = !Object.hasOwn(mine, name);
+  d.querySelector('.t').textContent = `${name} ${line(v)}`;
+  d.querySelector('summary').title = a[name]?.[6] ?? 'Custom settings.';
+  d.querySelectorAll('[data-k]').forEach(e => e.previousElementSibling.textContent = FMT[e.dataset.k](e.value));
+  refreshStack();
+};
+const fill = () => {
+  const a = all();
+  layers().forEach(d => d.querySelector('.ps').replaceChildren(...['custom', ...Object.keys(a)].map(k => new Option(k === 'custom' ? k : `${k} ${line(a[k])}`, k))));
+  layers().forEach(refresh);
+};
+const fillStacks = () => stacks.replaceChildren(...['custom', ...Object.keys(stacksMine)].map(k => new Option(k)));
+
+// audio: layer source -> layer gain (level/10) -> master volume -> limiter -> out
+let ctx, master;
+
+const init = () => {
+  if (ctx) return;
+  ctx = new AudioContext();
+  master = ctx.createGain();
+  master.gain.value = vol.value;
+  const lim = ctx.createDynamicsCompressor();
+  Object.entries({ threshold: -6, knee: 0, ratio: 20, attack: 0.003, release: 0.25 }).forEach(([k, v]) => lim[k].value = v);
+  master.connect(lim);
+  lim.connect(ctx.destination);
+};
+
+const halt = d => { d.src?.stop(); d.src = null; };
+const playing = () => layers().some(d => d.src);
+const sync = () => { // play/pause labels are derived from which layers have a live source
+  layers().forEach(d => d.querySelector('.pp').textContent = d.src ? '⏸' : '▶');
+  b.textContent = playing() ? 'Stop' : 'Play';
+};
+
+const make = d => { // one loudness-matched loop for this layer, or null if its band is empty
+  const sr = ctx.sampleRate, [tilt, lo, hi, den, grey] = vals(d);
+  const [x, rmsA] = shape(source(sr ** (den - 1)), sr, { tilt, lo: 10 ** lo, hi: 10 ** hi, grey });
+  const pk = peak(x);
+  return pk ? Float32Array.from(x, v => v * Math.min(TARGET / rmsA, 0.9 / pk)) : null;
+};
+
+const gen = d => {
+  init(); ctx.resume();
+  halt(d);
+  const data = make(d);
+  if (!data) return sync(); // empty band: nothing to play
+  const buf = ctx.createBuffer(1, N, ctx.sampleRate);
+  buf.copyToChannel(data, 0);
+  if (!d.gn) { d.gn = ctx.createGain(); d.gn.connect(master); }
+  d.gn.gain.value = sl(d, 'level').value / 10;
+  d.src = ctx.createBufferSource();
+  d.src.buffer = buf;
+  d.src.loop = true;
+  d.src.connect(d.gn);
+  d.src.start();
+  sync();
+};
+
+const stop = () => { layers().forEach(halt); sync(); };
+const play = () => layers().forEach(gen);
+
+const addLayer = v => {
+  const d = document.createElement('details');
+  d.className = 'layer';
+  d.open = true;
+  d.innerHTML = '<summary><button class="pp">▶</button> <span class="t"></span></summary><select class="ps"></select>' +
+    SL.map(([k, t, a, z, s, x]) => `<label>${t}<output></output><input data-k="${k}" type="range" min="${a}" max="${z}" step="${s}" value="${x}"></label>`).join('') +
+    '<div class="row"><input class="nm" placeholder="Preset name"><button class="sv">Save</button><button class="dl" hidden>Delete</button><button class="rm">Remove</button></div>';
+  stack.append(d);
+  SL.forEach(([k], i) => sl(d, k).value = v[i]);
+  fill();
+  if (playing()) gen(d); else sync();
+};
+const clear = () => { layers().forEach(d => { halt(d); d.gn?.disconnect(); }); stack.replaceChildren(); };
+
+stack.oninput = e => {
+  const d = e.target.closest('.layer'), k = e.target.dataset.k;
+  if (!k) return;
+  const lo = sl(d, 'lo'), hi = sl(d, 'hi'); // low cut stays below high cut: moving one pushes the other
+  if (k === 'lo') hi.value = Math.max(+hi.value, +lo.value + 0.1);
+  if (k === 'hi') lo.value = Math.min(+lo.value, +hi.value - 0.1);
+  if (k === 'level' && d.gn) d.gn.gain.value = e.target.value / 10;
+  refresh(d);
+};
+stack.onchange = e => { // regenerate on release, not while dragging; level needs no regeneration
+  const t = e.target, d = t.closest('.layer'), isPs = t.classList.contains('ps');
+  if (isPs) { const p = all()[t.value]; if (p) SL.forEach(([k], i) => sl(d, k).value = p[i]); refresh(d); }
+  if (d?.src && (isPs || (t.dataset.k && t.dataset.k !== 'level'))) gen(d);
+};
+stack.onclick = e => {
+  const t = e.target, d = t.closest('.layer');
+  if (t.className === 'pp') { d.src ? halt(d) : gen(d); sync(); }
+  if (t.className === 'rm') { halt(d); d.gn?.disconnect(); d.remove(); refreshStack(); sync(); }
+  if (t.className === 'sv') {
+    const n = d.querySelector('.nm').value.trim();
+    if (!n || n === 'custom' || (n in all() && !Object.hasOwn(mine, n))) { info.textContent = 'Pick another name.'; return; }
+    mine[n] = [...vals(d), 'Saved preset.'];
+    store('noise-presets', mine); fill();
+  }
+  if (t.className === 'dl') { delete mine[d.querySelector('.ps').value]; store('noise-presets', mine); fill(); }
+};
+
+add.onclick = () => addLayer(P.white);
+b.onclick = () => playing() ? stop() : play();
+vol.oninput = () => { if (master) master.gain.value = vol.value; };
+const setStack = ls => { // replace all layers; keep playing if something was
+  const was = playing();
+  clear();
+  ls.forEach(v => addLayer(v));
+  if (was) layers().forEach(gen);
+  refreshStack();
+};
+stacks.onchange = () => { const s = stacksMine[stacks.value]; if (s) setStack(s); refreshStack(); };
+saveStack.onclick = () => {
+  const n = snm.value.trim();
+  if (!n || n === 'custom' || n in Object.prototype) { info.textContent = 'Pick another name.'; return; }
+  stacksMine[n] = layers().map(vals);
+  store('noise-stacks', stacksMine); fillStacks(); refreshStack(); snm.value = '';
+};
+delStack.onclick = () => { delete stacksMine[stacks.value]; store('noise-stacks', stacksMine); fillStacks(); refreshStack(); };
+
+// share / export / import: the textarea carries the stack as text, in either direction
+const bundle = () => {
+  const name = stacks.value !== 'custom' ? stacks.value : snm.value.trim() || 'Colour noise stack';
+  return { name, json: { noise: 1, name, layers: layers().map(vals) } };
+};
+share.onclick = async () => {
+  const { name, json } = bundle();
+  io.value = `${name}\n${layers().map(d => d.querySelector('.t').textContent).join('\n')}\n\n${JSON.stringify(json)}`;
+  if (!navigator.share) { info.textContent = 'Copy the text in the box to send it.'; return; }
+  try { await navigator.share({ title: name, text: io.value }); } catch {} // cancelled or blocked: the text stays in the box
+};
+// ---- audio file ----
+const crcTable = Uint32Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+const crc32 = u => { let c = ~0; for (const b of u) c = crcTable[(c ^ b) & 255] ^ (c >>> 8); return ~c >>> 0; };
+const zip1 = (name, data) => { // single stored (uncompressed) file
+  const n = new TextEncoder().encode(name), L = 30 + n.length, C = 46 + n.length, c = L + data.length, e = c + C;
+  const out = new Uint8Array(e + 22), v = new DataView(out.buffer), crc = crc32(data);
+  const u16 = (o, x) => v.setUint16(o, x, true), u32 = (o, x) => v.setUint32(o, x, true);
+  u32(0, 0x04034b50); u16(4, 20); u16(12, 0x21); u32(14, crc); u32(18, data.length); u32(22, data.length); u16(26, n.length);
+  out.set(n, 30); out.set(data, L);
+  u32(c, 0x02014b50); u16(c + 4, 20); u16(c + 6, 20); u16(c + 14, 0x21); u32(c + 16, crc); u32(c + 20, data.length); u32(c + 24, data.length); u16(c + 28, n.length);
+  out.set(n, c + 46);
+  u32(e, 0x06054b50); u16(e + 8, 1); u16(e + 10, 1); u32(e + 12, C); u32(e + 16, c);
+  return out;
+};
+const wav = (x, sr, n) => { // 16-bit mono PCM, n samples, repeating x (the loop is seamless)
+  const v = new DataView(new ArrayBuffer(44 + n * 2));
+  const tag = (o, t) => [...t].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  tag(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); tag(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  tag(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x[i % x.length])) * 32767, true);
+  return new Uint8Array(v.buffer);
+};
+// ---- end audio file ----
+
+const LAME = ['https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js', 'https://cdn.jsdelivr.net/npm/lamejs-fixed@1.2.2/lame.min.js'];
+const loadScript = src => new Promise((ok, no) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = no; document.head.append(s); });
+const mp3 = async (x, sr, n, kbps) => { // lamejs loads on first use; each pinned source is tried in turn
+  for (const src of LAME) { if (window.lamejs) break; await loadScript(src).catch(() => {}); }
+  const enc = new lamejs.Mp3Encoder(1, sr, kbps), parts = [];
+  const pcm = Int16Array.from({ length: n }, (_, i) => Math.max(-1, Math.min(1, x[i % x.length])) * 32767);
+  for (let i = 0; i < n; i += 1152) parts.push(enc.encodeBuffer(pcm.subarray(i, i + 1152)));
+  parts.push(enc.flush());
+  return new Uint8Array(await new Blob(parts).arrayBuffer());
+};
+
+const saveFile = async (filename, data, type = 'application/json') => {
+  const dl = await window.claude?.use('downloads'); // published page: viewer-confirmed save, whose allowlist has no .wav or .mp3, so audio goes in a zip
+  if (dl) return dl.save(/\.(wav|mp3)$/.test(filename) ? { filename: filename.replace(/\.\w+$/, '.zip'), data: zip1(filename, data) } : { filename, data }).catch(() => {});
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([data], { type })), download: filename });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+saveJson.onclick = () => {
+  const { name, json } = bundle();
+  saveFile(`${name.replace(/[^\w -]+/g, '').trim() || 'stack'}.json`, JSON.stringify(json, null, 1));
+};
+const importStack = () => {
+  try {
+    const j = JSON.parse(io.value.match(/\{[\s\S]*\}/)[0]), ls = j.layers;
+    if (!Array.isArray(ls) || !ls.length || ls.length > 16 || !ls.every(v => Array.isArray(v) && v.length >= 6 && v.slice(0, 6).every(Number.isFinite))) throw 0;
+    setStack(ls.map(v => v.slice(0, 6)));
+    snm.value = typeof j.name === 'string' ? j.name : '';
+    info.textContent = 'Stack imported. Save stack to keep it.';
+  } catch { info.textContent = 'Not a valid stack.'; }
+};
+audioBtn.onclick = async () => { // all layers mixed at their levels, tiled to 5 whole loops
+  init();
+  const parts = layers().map(d => [make(d), sl(d, 'level').value / 10]).filter(([x]) => x);
+  if (!parts.length) { info.textContent = 'Nothing to export.'; return; }
+  const mix = new Float32Array(N);
+  parts.forEach(([x, g]) => x.forEach((v, i) => mix[i] += v * g));
+  const k = Math.min(1, 0.99 / peak(mix)); // only scale down to avoid clipping
+  const sr = ctx.sampleRate, n = 5 * N, [kind, kbps] = fmt.value.split('-'); // whole loops, so the file wraps seamlessly
+  const scaled = mix.map(v => v * k);
+  try {
+    const bytes = kind === 'wav' ? wav(scaled, sr, n) : await mp3(scaled, sr, n, +kbps);
+    saveFile(`${bundle().name.replace(/[^\w -]+/g, '').trim() || 'noise'}.${kind}`, bytes, kind === 'wav' ? 'audio/wav' : 'audio/mpeg');
+  } catch { info.textContent = 'Could not load the MP3 encoder.'; }
+};
+imp.onclick = importStack;
+pick.onchange = async () => { io.value = await pick.files[0].text(); importStack(); pick.value = ''; };
+
+fillStacks();
+addLayer(P.white);
+</script>
