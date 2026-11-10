@@ -1,2 +1,2 @@
 # NoiseBow
-Your rainbow of nouse colours
+Your rainbow of noise colours
