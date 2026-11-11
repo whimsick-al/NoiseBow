@@ -2,6 +2,9 @@
 <meta charset="utf-8">
 <meta name="description" content="NoiseBow: your rainbow of noise colours. Layered white, pink, brown and more, with tilt, cut filters, density, saved stacks and audio export.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌈</text></svg>">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#14121c">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>NoiseBow</title>
 <style>
@@ -41,6 +44,7 @@
 <input id="pick" type="file" accept=".json,application/json">
 <p id="info"></p>
 <p class="note">Audio saves as 5 whole loops (~55–60 s) that repeat seamlessly. WAV is best for looping; MP3 adds a small gap at the loop point. Keep the volume low: deep presets can stress small speakers. MP3 encoding by lamejs (LGPL, lame.sourceforge.net), loaded on demand.</p>
+<p class="note">NoiseBow by whimsick-al. Built with Claude (Anthropic) as Sr. Dev.</p>
 <script>
 // ---- dsp ----
 const N = 2 ** 19;     // power of two; spectral synthesis makes the loop periodic, so it is seamless
@@ -363,4 +367,5 @@ pick.onchange = async () => { io.value = await pick.files[0].text(); importStack
 
 fillStacks();
 addLayer(P.white);
+navigator.serviceWorker?.register('sw.js').catch(() => {}); // lets browsers offer Install; harmless where unsupported
 </script>

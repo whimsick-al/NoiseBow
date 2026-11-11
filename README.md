@@ -28,3 +28,12 @@ A single-file, in-browser noise generator. Build a **stack** of **layers**, each
 ## Hosting
 
 It is one file: `index.html`. Put it on any static host, for example GitHub Pages (repo settings, Pages, deploy from `main`, root).
+
+## Credits
+
+Concept, direction and testing: whimsick-al.
+Code: Claude (Anthropic), Sr. Dev. It started with the question "what colour is off-station radio static?"
+
+## Install
+
+Installable as an app: open the site in Chrome, then menu, **Install app**. It needs `manifest.webmanifest`, `sw.js` and the two icons next to `index.html`.
