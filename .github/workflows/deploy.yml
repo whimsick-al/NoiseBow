@@ -1,0 +1,48 @@
+# Builds the site from every .zip in the repo root plus the loose files in the repo.
+# Whatever was committed last wins: zips are unpacked oldest first, and a loose file is applied
+# only if it was committed at or after the newest zip. A new zip therefore replaces older loose files,
+# and a single file uploaded after a zip replaces that zip's copy.
+# Each zip should have its files at the top level (index.html, not folder/index.html).
+# Pages source must be set to "GitHub Actions".
+name: Deploy site from zips and files
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, needed to order zips by commit date
+      - name: Unpack
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir _deploy
+          for f in *.zip; do echo "$(git log -1 --format=%ct -- "$f")|$f"; done | sort -n | cut -d'|' -f2- |
+            while IFS= read -r z; do unzip -oq "$z" -d _deploy; done
+          newest=$(for f in *.zip; do git log -1 --format=%ct -- "$f"; done | sort -n | tail -1)
+          git ls-files | grep -v '^\.github/' | grep -v '\.zip$' | while IFS= read -r f; do
+            if [ "$(git log -1 --format=%ct -- "$f")" -ge "${newest:-0}" ]; then cp --parents "$f" _deploy/; fi
+          done
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _deploy
+      - id: deployment
+        uses: actions/deploy-pages@v4
